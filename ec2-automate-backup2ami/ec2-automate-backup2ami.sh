@@ -1,6 +1,6 @@
 #!/bin/bash -
-# Date: 2015-09-09
-# Version 4.1
+# Date: 2017-11-23
+# Version 5.0
 # License Type: GNU GENERAL PUBLIC LICENSE, Version 3
 # Author:
 # Colin Johnson / https://github.com/colinbjohnson / colin@cloudavail.com
@@ -25,6 +25,28 @@ prerequisite_check() {
   done
 }
 
+#-- iterates the expression until the output is non-zero
+wait_until()
+{
+result=`eval  $* | sed 's/ //g'`
+if [[ $result == 0 ]]
+then
+    sleep 60
+    wait_until $*
+fi
+}
+
+#-- iterates the expression until the output is zero
+wait_till()
+{
+result=`eval  $* | sed 's/ //g'`
+if [[ $result != 0 ]]
+then
+    sleep 60
+    wait_till $*
+fi
+}
+
 #get_IList gets a list of available instances in a specified region
 get_IList() {
   case $selection_method in
@@ -45,7 +67,7 @@ get_IList() {
   esac
   #creates a list of all instances that match the selection string from above
   instance_backup_list_complete=$(ec2-describe-instances --show-empty-fields --region $region $instance_selection_string 2>&1)
-  #takes the output of the previous command
+  #takes the output of the previous command 
   instance_backup_list_result=$(echo $?)
   if [[ $instance_backup_list_result -gt 0 ]]; then
     echo -e "An error occured when running ec2-describe-instances. The error returned is below:\n$instance_backup_list_complete" 1>&2 ; exit 70
@@ -60,25 +82,28 @@ tag_ami_resource() {
     region=$1
     shift
     tags=$@
-
+    
     # exit if AMI is no longer exists
     ec2-describe-images $resource_id --region $region | grep -q ^BLOCKDEVICEMAPPING || exit
-    
+
     echo "=== Tagging AMI $resource_id in $region region with the following tags: $tags"
     ec2-create-tags $resource_id --region $region $tags
 
     # wait until snapshots become available, then tag them
     snapshots=""
     while [[ ! -n $snapshots ]]; do
-        snapshots=$(ec2-describe-images $resource_id --region $region | grep ^BLOCKDEVICEMAPPING | grep "snap" | awk '{print $4}')
-        [[ -n $snapshots ]] && break
-        # the snapshot ids are not yet available => wait another 5 minutes
-        sleep 300
+	snapshots=$(ec2-describe-images $resource_id --region $region | grep ^BLOCKDEVICEMAPPING | grep "snap" | awk '{print $4}')
+	[[ -n $snapshots ]] && break
+	# the snapshot ids are not yet available => wait another 5 minutes
+	sleep 300
     done
-
+    
     for ec2_snapshot_resource_id in $snapshots; do
         echo "=== Tagging Snapshot $ec2_snapshot_resource_id (AMI: $resource_id) with the following tags: $tags"
-        ec2-create-tags $ec2_snapshot_resource_id --region $region $tags
+        ec2_create_tag_result=$(ec2-create-tags $ec2_snapshot_resource_id --region $region $tags)
+	if [[ $? != 0 ]]; then
+    	    echo -e "An error occured when running 'ec2-create-tags $ec2_snapshot_resource_id --region $region $tags'. The error returned is below:\n$ec2_create_tag_result" 1>&2
+    	fi
     done
 }
 
@@ -96,7 +121,11 @@ create_AMI_Tags() {
   #if $name_tag_create is true then add instance name to the variable $snapshot_tags
   if $name_tag_create; then
     ec2_snapshot_name=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
-    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name"
+    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name --tag Group=$ec2_snapshot_group"
+    ec2_snapshot_group=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Group | cut -f 5)
+    if [[ -n $ec2_snapshot_group ]]; then
+	snapshot_tags="$snapshot_tags --tag Group=$ec2_snapshot_group"
+    fi
   fi
   #if $hostname_tag_create is true then append --tag InitiatingHost=$(hostname -f) to the variable $snapshot_tags
   if $hostname_tag_create; then
@@ -114,10 +143,19 @@ create_AMI_Tags() {
   #if $snapshot_tags is not zero length then set the tag on the snapshot using ec2-create-tags
   if [[ -n $snapshot_tags ]]; then
     if [[ -n $original_ami_id ]]; then
-        tag_ami_resource $ami_id $ami_region $snapshot_tags "--tag SourceRegion=$instance_region" &
-        tag_ami_resource $original_ami_id $instance_region $snapshot_tags "--tag CopyRegion=$ami_region" &
+	tag_ami_resource $ami_id $ami_region $snapshot_tags "--tag SourceRegion=$instance_region" &
+	tag_ami_resource $original_ami_id $instance_region $snapshot_tags "--tag CopyRegion=$ami_region" &
     else
-        tag_ami_resource $ami_id $ami_region $snapshot_tags &
+	#-- if load average for last 5 mins more than 3, wait for 5 minutes before continue
+	LA_5min=$(uptime | cut -f5 -d,)
+	LA_5min=${LA_5min%.*}
+	while [ $LA_5min -ge 1 ]; do
+	    echo "=== System is overloaded, waiting for 5 minutes before continue..."
+	    sleep 300
+	    LA_5min=$(uptime | cut -f5 -d,)
+	    LA_5min=${LA_5min%.*}
+	done
+	tag_ami_resource $ami_id $ami_region $snapshot_tags &
     fi
   fi
 }
@@ -125,19 +163,20 @@ create_AMI_Tags() {
 copy_AMI() {
   # copies AMI to another region for extra safety
   random_region=$1
+  ec2_snapshot_name=$2
 
   #if $random_region is not zero length then set do the copy
   if [[ -n $random_region ]]; then
-    echo "=== Copying AMI $ec2_ami_resource_id to randomly selected $random_region region"
+    echo "=== Copying AMI $ec2_ami_resource_id ($ec2_snapshot_name) to randomly selected $random_region region"
 
     # wait until AMI become available, then copy it
     ami_status=1
     while [ $ami_status -ne 0 ]; do
-        ec2-describe-images --region $region $ec2_ami_resource_id --hide-tags | grep ^IMAGE | cut -f5 | grep -q available
-        ami_status=$?
-        [[ $ami_status -eq 0 ]] && break
-        # the ami is not yet available => wait another 10 minutes
-        sleep 600
+	ec2-describe-images --region $region $ec2_ami_resource_id --hide-tags | grep ^IMAGE | cut -f5 | grep -q available
+	ami_status=$?
+	[[ $ami_status -eq 0 ]] && break
+	# the ami is not yet available => wait another 10 minutes
+	sleep 600
     done
 
     ec2_copy_ami_result=$(ec2-copy-image --source-region $region --source-ami-id $ec2_ami_resource_id --region $random_region --name $ec2_snapshot_name --description "Backup of $ec2_ami_resource_id from $region region" 2>&1)
@@ -188,9 +227,9 @@ get_purge_after_date()
 {
 #based on the date_binary variable, the case statement below will determine the method to use to determine "purge_after_days" in the future
 case $date_binary in
-        linux-gnu) echo `date -d "@${purge_after_date_fe}" -u +%Y-%m-%d` ;;
-#       osx-posix) echo `date -j "${purge_after_date_fe}" -u +%Y-%m-%d` ;;
-        *) echo `date -d "${purge_after_date_fe}" -u +%Y-%m-%d` ;;
+	linux-gnu) echo `date -d "@${purge_after_date_fe}" -u +%Y-%m-%d` ;;
+#	osx-posix) echo `date -j "${purge_after_date_fe}" -u +%Y-%m-%d` ;;
+	*) echo `date -d "${purge_after_date_fe}" -u +%Y-%m-%d` ;;
 esac
 }
 
@@ -198,9 +237,9 @@ get_purge_after_date_epoch()
 {
 #based on the date_binary variable, the case statement below will determine the method to use to determine "purge_after_date_epoch" in the future
 case $date_binary in
-        linux-gnu) echo `date -d $purge_after_date +%s` ;;
-        osx-posix) echo `date -j -f "%Y-%m-%d" $purge_after_date "+%s"` ;;
-        *) echo `date -d $purge_after_date +%s` ;;
+	linux-gnu) echo `date -d $purge_after_date +%s` ;;
+	osx-posix) echo `date -j -f "%Y-%m-%d" $purge_after_date "+%s"` ;;
+	*) echo `date -d $purge_after_date +%s` ;;
 esac
 }
 
@@ -208,9 +247,9 @@ get_date_current_epoch()
 {
 #based on the date_binary variable, the case statement below will determine the method to use to determine "date_current_epoch" in the future
 case $date_binary in
-        linux-gnu) echo `date -d $date_current +%s` ;;
-        osx-posix) echo `date -j -f "%Y-%m-%d" $date_current "+%s"` ;;
-        *) echo `date -d $date_current +%s` ;;
+	linux-gnu) echo `date -d $date_current +%s` ;;
+	osx-posix) echo `date -j -f "%Y-%m-%d" $date_current "+%s"` ;;
+	*) echo `date -d $date_current +%s` ;;
 esac
 }
 
@@ -236,21 +275,21 @@ purge_AMIs() {
       #Alerts user to the fact that a Snapshot was found with PurgeAllow=true but with no PurgeAfterFE date.
       echo "=== AMI with the AMI ID \"$ami_id_evaluated\" has the tag \"PurgeAllow=true\" but does not have a \"PurgeAfterFE=xxxxxxxxxx\" key/value pair. $app_name is unable to determine if $ami_id_evaluated should be purged." 1>&2
     else
-      # if $purge_after_fe is less than $current_date then
-      # PurgeAfterFE is earlier than the current date
+      # PurgeAfterFE is earlier than today
       # and the snapshot can be safely purged
-      if [[ $purge_after_fe < $current_date ]]; then
+      if [[ $current_date > $purge_after_fe ]]; then
         # get appropriate snapshot-ids firstly
-        snapshot_purge_list=$(ec2-describe-images --region $region $ami_id_evaluated | grep BLOCKDEVICEMAPPING | awk '{print $4}')
+#        snapshot_purge_list=$(ec2-describe-images --region $region $ami_id_evaluated | grep BLOCKDEVICEMAPPING | awk '{print $4}')
 
         echo "=== AMI \"$ami_id_evaluated\" with the PurgeAfterFE date of \"$purge_after_fe\" will be deleted."
         ec2-deregister --region $region $ami_id_evaluated
+#        wait_till "ec2-describe-images --region $region $ami_id_evaluated | wc -l"
 
-        # purge snapshots of the selected AMI
-        for snapshot_id_evaluated in $snapshot_purge_list; do
-            echo "=== Snapshot \"$snapshot_id_evaluated\" of the AMI \"$ami_id_evaluated\" will be deleted."
-            ec2-delete-snapshot --region $region $snapshot_id_evaluated
-        done
+	# purge snapshots of the selected AMI
+#	for snapshot_id_evaluated in $snapshot_purge_list; do
+#    	    echo "=== Snapshot \"$snapshot_id_evaluated\" of the AMI \"$ami_id_evaluated\" will be deleted."
+#    	    ec2-delete-snapshot --region $region $snapshot_id_evaluated
+#    	done
       fi
     fi
   done
@@ -281,7 +320,8 @@ purge_EBS_Snapshots() {
       # if $purge_after_fe is less than $current_date then
       # PurgeAfterFE is earlier than the current date
       # and the snapshot can be safely purged
-      if [[ $purge_after_fe < $current_date ]]; then
+      # we postpone EBS snapshot removal to the next day, since corresponding AMI removal might not be completed yet
+      if [[ $purge_after_fe+86400 < $current_date ]]; then
         echo "=== Snapshot \"$snapshot_id_evaluated\" with the PurgeAfterFE date of \"$purge_after_fe\" will be deleted."
         ec2-delete-snapshot --region $region $snapshot_id_evaluated
       fi
@@ -366,7 +406,7 @@ for region in $regions; do
 
   if [[ -n $make_copy_tag ]]; then
     if [[ -z $other_regions ]]; then
-        other_regions=$(ec2-describe-regions | grep REGION | grep -v $region | cut -f2)
+	other_regions=$(ec2-describe-regions | grep REGION | grep -v $region | cut -f2)
     fi
     arr=($other_regions)
     other_regions_count=${#arr[*]}
@@ -377,6 +417,8 @@ for region in $regions; do
 
   #get_IList gets a list of AMIs for which a snapshot is desired. The list of AMIs depends upon the selection_method that is provided by user input
   get_IList
+  
+#  instance_backup_list="i-a379294d"
 
   #the loop below is called once for each volume in $ebs_backup_list - the currently selected EBS volume is passed in as "ebs_selected"
   for instance_selected in $instance_backup_list; do
@@ -387,7 +429,7 @@ for region in $regions; do
     echo "=== Starting: ec2-create-image -v -n $ec2_snapshot_name --no-reboot --region $region -d $ec2_snapshot_description $instance_selected"
     ec2_create_ami_result=$(ec2-create-image -n "$ec2_snapshot_name" -v --no-reboot --region $region -d "$ec2_snapshot_description" $instance_selected 2>&1)
     if [[ $? != 0 ]]; then
-      echo -e "An error occured when running ec2-create-image. The error returned is below:\n$ec2_create_ami_result" 1>&2 ; exit 70
+      echo -e "An error occured when running ec2-create-image $ec2_snapshot_name. The error returned is below:\n$ec2_create_ami_result" 1>&2
     else
       ec2_ami_resource_id=$(echo "$ec2_create_ami_result" | grep ^IMAGE | cut -f 2)
       create_AMI_Tags $ec2_ami_resource_id $region
@@ -395,7 +437,16 @@ for region in $regions; do
       ec2-describe-instances --region $region ${instance_selected} --filter tag:$make_copy_tag | grep -q INSTANCE
       make_copy=$?
       if [[ $make_copy -eq 0 ]]; then
-         copy_AMI $random_region &
+	#-- if load average for last 5 mins more than 3, wait for 5 minutes before continue
+	LA_5min=$(uptime | cut -f5 -d,)
+	LA_5min=${LA_5min%.*}
+	while [ $LA_5min -ge 1 ]; do
+	    echo "=== System is overloaded, waiting for 5 minutes before continue..."
+	    sleep 300
+	    LA_5min=$(uptime | cut -f5 -d,)
+	    LA_5min=${LA_5min%.*}
+	done
+        copy_AMI $random_region $ec2_snapshot_name &
       fi
     fi
   done
@@ -409,3 +460,5 @@ for region in $regions; do
   fi
 
 done
+
+echo "=== All's been done"
