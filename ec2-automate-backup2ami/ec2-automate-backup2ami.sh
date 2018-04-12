@@ -120,8 +120,8 @@ create_AMI_Tags() {
   snapshot_tags=""
   #if $name_tag_create is true then add instance name to the variable $snapshot_tags
   if $name_tag_create; then
-    ec2_snapshot_name=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
-    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name --tag Group=$ec2_snapshot_group"
+    ec2_snapshot_name_loc=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
+    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name_loc --tag Group=$ec2_snapshot_group"
     ec2_snapshot_group=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Group | cut -f 5)
     if [[ -n $ec2_snapshot_group ]]; then
 	snapshot_tags="$snapshot_tags --tag Group=$ec2_snapshot_group"
@@ -155,7 +155,7 @@ create_AMI_Tags() {
 	    LA_5min=$(uptime | cut -f5 -d,)
 	    LA_5min=${LA_5min%.*}
 	done
-	tag_ami_resource $ami_id $ami_region $snapshot_tags &
+	tag_ami_resource $ami_id $ami_region $snapshot_tags
     fi
   fi
 }
@@ -163,11 +163,11 @@ create_AMI_Tags() {
 copy_AMI() {
   # copies AMI to another region for extra safety
   random_region=$1
-  ec2_snapshot_name=$2
+  ec2_snapshot_name_loc=$2
 
   #if $random_region is not zero length then set do the copy
   if [[ -n $random_region ]]; then
-    echo "=== Copying AMI $ec2_ami_resource_id ($ec2_snapshot_name) to randomly selected $random_region region"
+    echo "=== Copying AMI $ec2_ami_resource_id ($ec2_snapshot_name_loc) to randomly selected $random_region region"
 
     # wait until AMI become available, then copy it
     ami_status=1
@@ -179,13 +179,18 @@ copy_AMI() {
 	sleep 600
     done
 
-    ec2_copy_ami_result=$(ec2-copy-image --source-region $region --source-ami-id $ec2_ami_resource_id --region $random_region --name $ec2_snapshot_name --description "Backup of $ec2_ami_resource_id from $region region" 2>&1)
+    ec2_copy_ami_result=$(ec2-copy-image --source-region $region --source-ami-id $ec2_ami_resource_id --region $random_region --name $ec2_snapshot_name_loc --description "Backup of $ec2_ami_resource_id from $region region" 2>&1)
 
     if [[ $? != 0 ]]; then
       echo -e "An error occured when running ec2-copy-image. The error returned is below:\n$ec2_copy_ami_result" 1>&2 ; exit 70
     else
       original_ami_id=$ec2_ami_resource_id
       ec2_ami_resource_id=$(echo "$ec2_copy_ami_result" | grep ^IMAGE | cut -f 2)
+      if [ "x$ec2_ami_resource_id" = "x" ]; then
+        echo "*** error: AMI ID is empty for copied AMI"
+        echo "$ec2_copy_ami_result"
+        echo "***"
+      fi
       create_AMI_Tags $ec2_ami_resource_id $region $random_region $original_ami_id
     fi
   else
@@ -329,6 +334,36 @@ purge_EBS_Snapshots() {
   done
 }
 
+process_instance() {
+    ec2_snapshot_name_loc=$ec2_snapshot_name
+    ec2_snapshot_description_loc=$ec2_snapshot_description
+    instance_selected_loc=$instance_selected
+
+    echo "=== Starting: ec2-create-image -v -n $ec2_snapshot_name_loc --no-reboot --region $region -d $ec2_snapshot_description_loc $instance_selected_loc"
+    ec2_create_ami_result=$(ec2-create-image -n "$ec2_snapshot_name_loc" -v --no-reboot --region $region -d "$ec2_snapshot_description_loc" $instance_selected_loc 2>&1)
+    if [[ $? != 0 ]]; then
+      echo -e "An error occured when running ec2-create-image $ec2_snapshot_name_loc. The error returned is below:\n$ec2_create_ami_result" 1>&2
+    else
+      ec2_ami_resource_id=$(echo "$ec2_create_ami_result" | grep ^IMAGE | cut -f 2)
+      create_AMI_Tags $ec2_ami_resource_id $region
+      [[ -z $make_copy_tag ]] && continue
+      ec2-describe-instances --region $region ${instance_selected_loc} --filter tag:$make_copy_tag | grep -q INSTANCE
+      make_copy=$?
+      if [[ $make_copy -eq 0 ]]; then
+	#-- if load average for last 5 mins more than 3, wait for 5 minutes before continue
+	LA_5min=$(uptime | cut -f5 -d,)
+	LA_5min=${LA_5min%.*}
+	while [ $LA_5min -ge 1 ]; do
+	    echo "=== System is overloaded, waiting for 5 minutes before continue..."
+	    sleep 300
+	    LA_5min=$(uptime | cut -f5 -d,)
+	    LA_5min=${LA_5min%.*}
+	done
+        copy_AMI $random_region $ec2_snapshot_name_loc
+      fi
+    fi
+}
+
 app_name=$(basename $0)
 #sets defaults
 selection_method="instanceid"
@@ -425,30 +460,7 @@ for region in $regions; do
     ec2_snapshot_description="ec2ab_${instance_selected}_$date_current"
     ec2_snapshot_name=$(ec2-describe-instances --region $region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
     ec2_snapshot_name="ec2ab_${ec2_snapshot_name}_$date_current"
-
-    echo "=== Starting: ec2-create-image -v -n $ec2_snapshot_name --no-reboot --region $region -d $ec2_snapshot_description $instance_selected"
-    ec2_create_ami_result=$(ec2-create-image -n "$ec2_snapshot_name" -v --no-reboot --region $region -d "$ec2_snapshot_description" $instance_selected 2>&1)
-    if [[ $? != 0 ]]; then
-      echo -e "An error occured when running ec2-create-image $ec2_snapshot_name. The error returned is below:\n$ec2_create_ami_result" 1>&2
-    else
-      ec2_ami_resource_id=$(echo "$ec2_create_ami_result" | grep ^IMAGE | cut -f 2)
-      create_AMI_Tags $ec2_ami_resource_id $region
-      [[ -z $make_copy_tag ]] && continue
-      ec2-describe-instances --region $region ${instance_selected} --filter tag:$make_copy_tag | grep -q INSTANCE
-      make_copy=$?
-      if [[ $make_copy -eq 0 ]]; then
-	#-- if load average for last 5 mins more than 3, wait for 5 minutes before continue
-	LA_5min=$(uptime | cut -f5 -d,)
-	LA_5min=${LA_5min%.*}
-	while [ $LA_5min -ge 1 ]; do
-	    echo "=== System is overloaded, waiting for 5 minutes before continue..."
-	    sleep 300
-	    LA_5min=$(uptime | cut -f5 -d,)
-	    LA_5min=${LA_5min%.*}
-	done
-        copy_AMI $random_region $ec2_snapshot_name &
-      fi
-    fi
+    process_instance &
   done
 
   #if purge_snapshots is true, then run purge_EBS_Snapshots function
