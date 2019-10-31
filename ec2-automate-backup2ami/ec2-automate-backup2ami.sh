@@ -121,7 +121,7 @@ create_AMI_Tags() {
   #if $name_tag_create is true then add instance name to the variable $snapshot_tags
   if $name_tag_create; then
     ec2_snapshot_name_loc=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
-    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name_loc
+    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name_loc"
     ec2_snapshot_group=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Group | cut -f 5)
     if [[ -n $ec2_snapshot_group ]]; then
 	snapshot_tags="$snapshot_tags --tag Group=$ec2_snapshot_group"
