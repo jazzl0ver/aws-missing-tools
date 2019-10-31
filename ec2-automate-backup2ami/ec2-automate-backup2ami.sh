@@ -84,7 +84,7 @@ tag_ami_resource() {
     tags=$@
     
     # exit if AMI is no longer exists
-    ec2-describe-images $resource_id --region $region | grep -q ^BLOCKDEVICEMAPPING || exit
+    ec2-describe-images $resource_id --region $region | grep -q ^BLOCKDEVICEMAPPING || { echo "No blockdevices for $resource_id"; ec2-describe-images $resource_id --region $region > /tmp/.test; exit; }
 
     echo "=== Tagging AMI $resource_id in $region region with the following tags: $tags"
     ec2-create-tags $resource_id --region $region $tags
@@ -121,7 +121,7 @@ create_AMI_Tags() {
   #if $name_tag_create is true then add instance name to the variable $snapshot_tags
   if $name_tag_create; then
     ec2_snapshot_name_loc=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Name | cut -f 5)
-    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name_loc --tag Group=$ec2_snapshot_group"
+    snapshot_tags="$snapshot_tags --tag Name=$ec2_snapshot_name_loc
     ec2_snapshot_group=$(ec2-describe-instances --region $instance_region ${instance_selected} | grep ^TAG | grep Group | cut -f 5)
     if [[ -n $ec2_snapshot_group ]]; then
 	snapshot_tags="$snapshot_tags --tag Group=$ec2_snapshot_group"
@@ -191,6 +191,9 @@ copy_AMI() {
         echo "$ec2_copy_ami_result"
         echo "***"
       fi
+      echo "Waiting for copy completed..."
+      AMI_AVAIL="ec2-describe-images --region $random_region $ec2_ami_resource_id | grep ^IMAGE | cut -f 5 | grep available | wc -l"
+      wait_until $AMI_AVAIL
       create_AMI_Tags $ec2_ami_resource_id $region $random_region $original_ami_id
     fi
   else
